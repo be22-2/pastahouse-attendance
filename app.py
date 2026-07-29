@@ -1,6 +1,10 @@
 
 import re
 import os
+import json
+import base64
+from datetime import datetime, timezone
+import requests
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -723,8 +727,97 @@ USERS_CONFIG, USING_DEFAULT_ACCOUNTS = render_login()
 CURRENT_ROLE = st.session_state.get("role", "viewer")
 IS_OWNER = CURRENT_ROLE == "owner"
 
-# اسم ملف البصمة الثابت الذي سيراه المدير تلقائيًا.
-DEFAULT_ATTENDANCE_FILE = Path(__file__).with_name("attendance.xlsx")
+# ملفات البصمة التي يتم حفظها تلقائيًا داخل مستودع GitHub.
+ATTENDANCE_FILES = [
+    Path(__file__).with_name("attendance_current.xls"),
+    Path(__file__).with_name("attendance_current.xlsx"),
+]
+ATTENDANCE_META_FILE = Path(__file__).with_name("attendance_meta.json")
+
+def find_saved_attendance_file():
+    for path in ATTENDANCE_FILES:
+        if path.exists():
+            return path
+    return None
+
+def github_settings():
+    try:
+        cfg = st.secrets.get("github", {})
+        token = str(cfg.get("token", "")).strip()
+        repo = str(cfg.get("repo", "")).strip()
+        branch = str(cfg.get("branch", "main")).strip() or "main"
+        if token and repo:
+            return token, repo, branch
+    except Exception:
+        pass
+    return None
+
+def _github_headers(token):
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+def _github_get_sha(token, repo, branch, path):
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    response = requests.get(url, headers=_github_headers(token), params={"ref": branch}, timeout=30)
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    return response.json().get("sha")
+
+def _github_put_file(token, repo, branch, path, content_bytes, message):
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content_bytes).decode("ascii"),
+        "branch": branch,
+    }
+    sha = _github_get_sha(token, repo, branch, path)
+    if sha:
+        payload["sha"] = sha
+    response = requests.put(url, headers=_github_headers(token), json=payload, timeout=60)
+    response.raise_for_status()
+
+def _github_delete_file(token, repo, branch, path, message):
+    sha = _github_get_sha(token, repo, branch, path)
+    if not sha:
+        return
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    response = requests.delete(
+        url,
+        headers=_github_headers(token),
+        json={"message": message, "sha": sha, "branch": branch},
+        timeout=30,
+    )
+    response.raise_for_status()
+
+def save_attendance_to_github(uploaded_file):
+    settings = github_settings()
+    if not settings:
+        raise RuntimeError("إعداد GitHub غير موجود في Secrets")
+    token, repo, branch = settings
+    suffix = Path(uploaded_file.name).suffix.lower()
+    if suffix not in {".xls", ".xlsx"}:
+        raise ValueError("الملف يجب أن يكون Excel بصيغة xls أو xlsx")
+    target = f"attendance_current{suffix}"
+    other = "attendance_current.xlsx" if suffix == ".xls" else "attendance_current.xls"
+    content = uploaded_file.getvalue()
+    now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+    _github_put_file(token, repo, branch, target, content, f"Update attendance file - {now}")
+    _github_delete_file(token, repo, branch, other, f"Remove old attendance file - {now}")
+    meta = {"original_name": uploaded_file.name, "updated_at": now, "updated_by": st.session_state.get("display_name", "بيان")}
+    _github_put_file(token, repo, branch, "attendance_meta.json", json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"), f"Update attendance metadata - {now}")
+    return target
+
+def read_attendance_meta():
+    try:
+        if ATTENDANCE_META_FILE.exists():
+            return json.loads(ATTENDANCE_META_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
 
 # =========================================================
 # Header
@@ -745,25 +838,39 @@ st.markdown("---")
 # =========================================================
 # Data Source + Filters
 # =========================================================
-data_source = None
+data_source = find_saved_attendance_file()
+meta = read_attendance_meta()
 
 if IS_OWNER:
-    st.caption("يمكنكِ رفع ملف جديد للتجربة، أو استخدام ملف attendance.xlsx المحفوظ مع المشروع.")
-    uploaded = st.file_uploader("رفع ملف Excel الخاص بالبصمة", type=["xlsx", "xls"])
+    st.subheader("تحديث بيانات الشهر")
+    st.caption("ارفعي ملف البصمة الجديد ثم اضغطي حفظ. بعد الحفظ يراه المدير تلقائيًا من نفس الرابط.")
+    uploaded = st.file_uploader("اختاري ملف Excel الخاص بالبصمة", type=["xlsx", "xls"], key="monthly_attendance_upload")
     if uploaded is not None:
-        data_source = uploaded
-    elif DEFAULT_ATTENDANCE_FILE.exists():
-        data_source = DEFAULT_ATTENDANCE_FILE
-        st.success("تم تحميل ملف البصمة المحفوظ تلقائيًا.")
+        col_save, col_preview = st.columns([1, 2])
+        with col_save:
+            if st.button("حفظ وتحديث الداشبورد", type="primary", use_container_width=True):
+                try:
+                    with st.spinner("جاري حفظ ملف الشهر..."):
+                        save_attendance_to_github(uploaded)
+                    st.success("تم حفظ ملف الشهر بنجاح. سيُحدّث التطبيق تلقائيًا خلال دقيقة أو دقيقتين.")
+                    st.info("بعد التحديث، المدير يفتح نفس الرابط ويشاهد البيانات مباشرة.")
+                except Exception as exc:
+                    st.error(f"تعذر حفظ الملف: {exc}")
+        with col_preview:
+            st.caption("يمكنكِ معاينة الملف الآن قبل اكتمال تحديث الموقع.")
+            data_source = uploaded
+    elif data_source is not None:
+        st.success("البيانات المحفوظة جاهزة للعرض.")
 else:
-    if DEFAULT_ATTENDANCE_FILE.exists():
-        data_source = DEFAULT_ATTENDANCE_FILE
-    else:
-        st.error("ملف البصمة غير مضاف إلى المشروع بعد. يجب على المسؤولة إضافة ملف باسم attendance.xlsx.")
+    if data_source is None:
+        st.info("لا توجد بيانات شهر محفوظة حتى الآن. ستظهر هنا تلقائيًا بعد أن ترفع المسؤولة ملف البصمة.")
         st.stop()
 
+if meta:
+    st.caption(f"آخر تحديث: {meta.get('updated_at', 'غير محدد')} — الملف: {meta.get('original_name', '')}")
+
 if data_source is None:
-    st.info("ارفعي ملف البصمة الآن، أو ضعيه بجانب الكود باسم attendance.xlsx.")
+    st.info("ارفعي ملف البصمة ثم اضغطي زر حفظ وتحديث الداشبورد.")
     st.stop()
 
 try:
